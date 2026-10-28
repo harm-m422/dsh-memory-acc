@@ -1,0 +1,19 @@
+# 依赖与构建产物
+node_modules/
+*.tgz
+
+# 分发的压缩包
+*.zip
+
+# 编辑器 / 系统锁文件（OnlyOffice 会在打开 README 时生成）
+.~lock.*#
+.#*
+*~
+*.swp
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+
+# 运行数据不在这里：它在 $DSH_ACC_HOME（默认 $DSH_HOME/acc/）

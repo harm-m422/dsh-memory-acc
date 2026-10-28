@@ -1,0 +1,38 @@
+{
+  "name": "dsh-memory-acc",
+  "version": "0.9.0",
+  "private": true,
+  "type": "module",
+  "description": "ACC memory: keep every complete conversation, borrow the harness's own model, never ask for a key.",
+  "license": "MIT",
+  "author": "harm-m422",
+  "homepage": "https://github.com/harm-m422/dsh-memory-acc#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/harm-m422/dsh-memory-acc.git"
+  },
+  "bugs": {
+    "url": "https://github.com/harm-m422/dsh-memory-acc/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}
