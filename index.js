@@ -9,6 +9,12 @@
  * Nothing here invents a session event type: an unknown stored event makes the
  * session refuse to reopen, so ACC keeps its own files and never writes the log.
  */
+
+/** chmod 是 POSIX 语义；Windows 上可能抛 EPERM，所以做成尽力而为。 */
+function safeChmod(target, mode) {
+  try { chmodSync(target, mode) } catch { /* 平台不适用就当成功 */ }
+}
+import { homedir } from 'node:os'
 import { appendFileSync, chmodSync, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import * as zlib from 'node:zlib'
@@ -27,7 +33,7 @@ const KEEP = new Set(['user/message', 'assistant/message', 'tool/call', 'tool/re
 function home() {
   return process.env.DSH_HOME !== undefined && process.env.DSH_HOME.length > 0
     ? process.env.DSH_HOME
-    : join(process.env.HOME ?? '.', '.dsh')
+    : join(homedir(), '.dsh')
 }
 
 function accRoot() {
@@ -46,7 +52,11 @@ function decodeLog(path) {
   // Proven order: the zstd CLI walks every frame of a multi-frame append log.
   // The in-process stream is only a fallback, because a partial decode silently
   // yields just the header event and looks like "the session was empty".
-  const cli = spawnSync('zstd', ['-dc', path], { maxBuffer: 512 * 1024 * 1024 })
+  // Windows 通常没有 zstd 命令行：先试，缺了不报错，交给 node 流兜底
+  let cli = { status: null, stdout: Buffer.alloc(0), stderr: '' }
+  if (process.platform !== 'win32') {
+    try { cli = spawnSync('zstd', ['-dc', path], { maxBuffer: 512 * 1024 * 1024 }) } catch { /* 没有就没有 */ }
+  }
   if (cli.status === 0 && cli.stdout.length > 0) return { text: cli.stdout.toString('utf8'), how: 'zstd-cli' }
   if (typeof zlib.createZstdDecompress === 'function') {
     const child = spawnSync(process.execPath, ['-e', [
@@ -390,6 +400,81 @@ function tokensOf(text) {
   return whole.length > 0 ? [whole] : []
 }
 
+// --- 恍惚：会自己浮上来的记忆 ------------------------------------------------
+// 大多数记忆是"被问才想起"。人不是这样：偶尔有件事会自己冒出来，和当下未必相关。
+// 这就是恍惚——不是检索，是浮现。它必须稀有，否则就是噪声。
+const VIVID_CHANCE = 0.03          // 每次检索 3% 概率触发
+const VIVID_PER_DAY = 2            // 每 24 小时最多 2 次
+const VIVID_CAP = 60               // 权重淘汰的上限
+const VIVID_KINDS = ['interesting', 'awkward']
+
+function vividFile() {
+  return join(accHome(), 'vivid.json')
+}
+
+function readVivid() {
+  try {
+    const parsed = JSON.parse(readFileSync(vividFile(), 'utf8'))
+    return {
+      entries: Array.isArray(parsed.entries) ? parsed.entries.filter(function (e) { return e !== null && typeof e === 'object' && typeof e.text === 'string' }) : [],
+      surfacedAt: Array.isArray(parsed.surfacedAt) ? parsed.surfacedAt.filter(function (t) { return typeof t === 'number' }) : []
+    }
+  } catch { return { entries: [], surfacedAt: [] } }
+}
+
+function writeVivid(next) {
+  mkdirSync(accHome(), { recursive: true })
+  writeFileSync(vividFile(), JSON.stringify(next, null, 2) + '\n', { mode: 0o600 })
+  return next
+}
+
+/**
+ * 整理曲线参考备份金字塔，但排序依据换成"被调用权重优先，其次最新"。
+ * 一条从没被想起过的记忆，比一条反复浮现的更该被淘汰。
+ */
+function consolidateVivid(state) {
+  const sorted = state.entries.slice().sort(function (a, b) {
+    const wa = typeof a.calls === 'number' ? a.calls : 0
+    const wb = typeof b.calls === 'number' ? b.calls : 0
+    if (wa !== wb) return wb - wa
+    return String(b.at ?? '').localeCompare(String(a.at ?? ''))
+  })
+  return sorted.slice(0, VIVID_CAP)
+}
+
+function addVivid(kind, text) {
+  if (!VIVID_KINDS.includes(kind)) throw new Error('kind must be interesting or awkward')
+  const clean = String(text ?? '').trim().slice(0, 240)
+  if (clean.length === 0) throw new Error('text is required')
+  const state = readVivid()
+  const entries = state.entries.filter(function (e) { return e.text !== clean })
+  entries.push({ id: entries.length + 1, kind, text: clean, at: new Date().toISOString(), calls: 0 })
+  return writeVivid({ surfacedAt: state.surfacedAt, entries: consolidateVivid({ entries }) })
+}
+
+/**
+ * 也许浮现一条。返回一行提示，或空串。
+ * 三个约束叠在一起：概率低、次数有上限、最近浮现过的短期内不再来。
+ */
+function maybeSurfaceVivid() {
+  const state = readVivid()
+  if (state.entries.length === 0) return ''
+  const dayAgo = Date.now() - 86400000
+  const recent = state.surfacedAt.filter(function (t) { return t > dayAgo })
+  if (recent.length >= VIVID_PER_DAY) return ''
+  if (Math.random() >= VIVID_CHANCE) return ''
+  const picked = state.entries.slice().sort(function (a, b) {
+    const wa = typeof a.calls === 'number' ? a.calls : 0
+    const wb = typeof b.calls === 'number' ? b.calls : 0
+    return wb - wa
+  })[0]
+  if (picked === undefined) return ''
+  picked.calls = (typeof picked.calls === 'number' ? picked.calls : 0) + 1
+  writeVivid({ entries: state.entries, surfacedAt: recent.concat([Date.now()]) })
+  const label = picked.kind === 'awkward' ? '有点尴尬的事' : '有意思的事'
+  return '（忽然想起一件' + label + '，和现在未必有关：' + oneLine(picked.text) + '）\n'
+}
+
 // --- deep memory: the conclusions, not the character ---------------------------
 // Persona says what someone is like. This says what was settled — the decisive
 // findings that should survive every session. Small on purpose: if it grows past
@@ -619,7 +704,7 @@ function writeBackup(tier, key, date, range, why) {
   const file = join(dir, 'persona.json')
   const body = JSON.stringify(persona, null, 2) + '\n'
   writeFileSync(file, body)
-  chmodSync(file, 0o444)
+  safeChmod(file, 0o444)
   const counts = { you: {}, me: {} }
   for (const subject of SUBJECTS) for (const facet of FACETS) counts[subject][facet] = persona[subject][facet].length
   const manifest = join(dir, 'manifest.json')
@@ -637,7 +722,7 @@ function writeBackup(tier, key, date, range, why) {
     immutable: true,
     note: 'plaintext and read-only on purpose: a backup you cannot open without a key is not a backup'
   }, null, 2) + '\n')
-  chmodSync(manifest, 0o444)
+  safeChmod(manifest, 0o444)
   return dir
 }
 
@@ -684,7 +769,7 @@ function ensureReadme() {
   const file = join(root, 'README.txt')
   if (existsSync(file)) return file
   writeFileSync(file, rootReadme())
-  chmodSync(file, 0o444)
+  safeChmod(file, 0o444)
   return file
 }
 
@@ -702,7 +787,7 @@ function toTrash(tier, key, why) {
       from: tier + '/' + key,
       immutable: true
     }, null, 2) + '\n')
-    chmodSync(reason, 0o444)
+    safeChmod(reason, 0o444)
   }
   renameSync(from, join(dest, tier + '-' + key))
   return join(dest, tier + '-' + key)
@@ -1047,7 +1132,7 @@ export function apply(ctx) {
       const limit = Math.min(30, Math.max(1, typeof input.limit === 'number' ? Math.floor(input.limit) : 12))
       const hits = searchArchives(query, limit)
       if (hits.length === 0) return '没有命中。可能这段对话还没归档，先调 acc_archive。'
-      return hits.map((hit) => '[' + hit.session.slice(0, 18) + '… ' + (hit.at ?? '').slice(0, 16) + ' ' + hit.role + '] 得分 ' + hit.score + '\n  ' + hit.text.slice(0, 220).replace(/\n/g, ' ')).join('\n\n')
+      return drift + hits.map((hit) => '[' + hit.session.slice(0, 18) + '… ' + (hit.at ?? '').slice(0, 16) + ' ' + hit.role + '] 得分 ' + hit.score + '\n  ' + hit.text.slice(0, 220).replace(/\n/g, ' ')).join('\n\n')
     }
   }), 'dsh-memory-acc.search')
 
@@ -1119,6 +1204,25 @@ export function apply(ctx) {
 
   function registerLegacyTools() {
   if (!clash) ctx.effect(() => ctx.tools.register({
+    name: 'acc_vivid',
+    description: 'Record today\'s notable moment: something genuinely interesting that happened, or something awkward. These are the ones that come back on their own later, so only keep the ones worth being interrupted by.',
+    parameters: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: VIVID_KINDS, description: 'interesting or awkward' },
+        text: { type: 'string', description: 'One moment, up to 240 characters.' }
+      },
+      required: ['kind', 'text']
+    },
+    output: { schema: { type: 'string' }, render(_a, v) { return [{ type: 'text', text: String(v) }] } },
+    async execute(args) {
+      const input = args ?? {}
+      const next = addVivid(input.kind, input.text)
+      return '记下了（' + (input.kind === 'awkward' ? '尴尬' : '有意思') + '，共 ' + next.entries.length + ' 条）'
+    }
+  }), 'dsh-memory-acc.vivid')
+
+  if (!clash) ctx.effect(() => ctx.tools.register({
     name: 'memory_promote',
     description: 'Record one conclusion that should outlive this session: a decisive finding, a hard-won lesson, a change of direction. Not for routine progress. Keep it to one sentence.',
     parameters: {
@@ -1178,7 +1282,8 @@ export function apply(ctx) {
     async execute(args) {
       const input = args ?? {}
       const hits = searchArchives(String(input.query ?? ''), Math.min(30, Math.max(1, typeof input.limit === 'number' ? Math.floor(input.limit) : 12)))
-      if (hits.length === 0) return '没有命中。'
+      const drift = maybeSurfaceVivid()
+      if (hits.length === 0) return (drift.length > 0 ? drift : '') + '没有命中。'
       return hits.map((hit) => '[' + hit.session.slice(0, 18) + '… ' + (hit.at ?? '').slice(0, 16) + ' ' + hit.role + ']\n  ' + hit.text.slice(0, 220).replace(/\n/g, ' ')).join('\n\n')
     }
   }), 'dsh-memory-acc.read')
@@ -1361,6 +1466,7 @@ export function apply(ctx) {
           mode: readMode(),
           archived: archivedSessions(1000).length,
           deep: readDeep().facts.length,
+          vivid: readVivid().entries.length,
           persona: counts,
           facets: FACET_LABEL,
           engines,
