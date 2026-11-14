@@ -163,8 +163,15 @@ function readLine(path) {
 // only evidence of a duplicate install there is. A shared table beats a heartbeat
 // file because the host process is the shared thing, and beats HTTP because every
 // route sits behind the browser-trust fence.
-const VERSION = '0.1.0'
+// 版本号只写在一个地方：package.json。握手表里露出的版本曾长期停在 0.1.0，
+// 于是「二选一」弹窗里显示的是 ACC v0.1.0 —— 对用户来说那就是个假版本号。
+const VERSION = (() => {
+  try { return String(JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version ?? '0.0.0') } catch { return '0.0.0' }
+})()
 const ENGINE_ID = 'dsh-memory-acc'
+// 「工具到底注册上没有」只有 apply 当时知道，事后靠冲突表反推会撒谎：
+// 把另一个引擎停用之后冲突已经为 0，但 ACC 这轮并没有注册过工具（apply 只跑一次）。
+let ACC_TOOLS_REGISTERED = false
 const REGISTRY = Symbol.for('dsh.memory.engines')
 
 function engines() {
@@ -174,6 +181,52 @@ function engines() {
 
 function engineList() {
   return Object.entries(engines()).map(([id, info]) => ({ id, kind: info.kind, version: info.version, at: info.at }))
+}
+
+// 谁装在这个 profile 里，patch 上是静态可读的；握手表只说明「谁已经 apply 过」，
+// 而两个插件谁先 apply 不确定 —— 按表判断，结果就取决于启动顺序。所以冲突看 patch。
+const MEMORY_IDS = { 'dsh-memory': 'memory', memory: 'memory', 'dsh-memory-acc': 'acc', 'memory-acc': 'acc' }
+
+/** 这一行属于哪个列表项（最近的、缩进更浅的 "- " 行）。 */
+function rowStart(lines, index) {
+  if (/^\s*-\s/.test(lines[index])) return index
+  const indent = lines[index].length - lines[index].trimStart().length
+  for (let k = index - 1; k >= 0; k -= 1) {
+    if (!/^\s*-\s/.test(lines[k])) continue
+    if (lines[k].length - lines[k].trimStart().length < indent) return k
+  }
+  return index
+}
+
+/**
+ * The memory engines the profile patch leaves enabled, or null when the patch is
+ * unreadable. Line-based on purpose: the patch is hand-written YAML with comments,
+ * and one boolean per engine is all that is needed here.
+ */
+function readProfileEngines() {
+  const dir = process.env.DSH_PROFILE_DIR ?? ''
+  if (dir.length === 0) return null
+  let raw = ''
+  try { raw = readFileSync(join(dir, 'cordis.patch.yml'), 'utf8') } catch { return null }
+  const lines = raw.split('\n')
+  const state = { memory: false, acc: false }
+  for (let i = 0; i < lines.length; i += 1) {
+    const m = /^\s*-\s*(?:id|name):\s*["']?([A-Za-z0-9._-]+)["']?\s*$/.exec(lines[i])
+    if (m === null) continue
+    const kind = MEMORY_IDS[m[1]]
+    if (kind === undefined) continue
+    const start = rowStart(lines, i)
+    const indent = lines[start].length - lines[start].trimStart().length
+    let disabled = false
+    for (let j = start + 1; j < lines.length; j += 1) {
+      const next = lines[j]
+      if (next.trim().length === 0) continue
+      if (next.length - next.trimStart().length <= indent) break
+      if (/^\s*disabled:\s*(true|yes)\s*$/.test(next)) disabled = true
+    }
+    if (!disabled) state[kind] = true
+  }
+  return state
 }
 
 /**
@@ -216,6 +269,67 @@ async function configRoute(req, res) {
   return sendJson(res, 200, { ok: true, root: next.root, encrypt: next.encrypt, effectiveRoot: dataRoot(), hasKey: accKey().length > 0, resident: next.resident ?? '' })
 }
 
+function escapeRe(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/** Does the parsed patch list carry `disabled: true` on the entry whose id or name is target? */
+function listHasDisabled(list, target) {
+  for (const entry of (Array.isArray(list) ? list : [])) {
+    const rows = Array.isArray(entry?.insert) ? entry.insert : []
+    for (const row of rows) if ((row?.id === target || row?.name === target) && row.disabled === true) return true
+    if ((entry?.id === target || entry?.name === target) && entry.disabled === true) return true
+  }
+  return false
+}
+
+/**
+ * Add `disabled: true` by inserting exactly one line, leaving every other byte
+ * (including the comments the user wrote) alone: a full YAML round-trip silently
+ * drops comments, and this file is hand-annotated.
+ * Returns { text, already } or null when no row matches.
+ */
+function insertDisabledLine(raw, target) {
+  if (target.length === 0) return null
+  const pattern = new RegExp('^(\\s*)(-\\s+)?(?:id|name):\\s*' + escapeRe(target) + '\\s*$')
+  const lines = raw.split('\n')
+  const out = []
+  let hit = false
+  let already = false
+  let i = 0
+  while (i < lines.length) {
+    const m = /^(\s*)-(\s+)/.exec(lines[i])
+    if (m === null) { out.push(lines[i]); i += 1; continue }
+    const dashIndent = m[1].length
+    let j = i + 1
+    while (j < lines.length) {
+      const next = lines[j]
+      if (next.trim().length === 0) { j += 1; continue }
+      if (next.length - next.trimStart().length <= dashIndent) break
+      j += 1
+    }
+    let inserted = false
+    for (let k = i; k < j; k += 1) {
+      out.push(lines[k])
+      const hitLine = pattern.exec(lines[k])
+      if (hitLine === null) continue
+      hit = true
+      // 一行里 id 和 name 都等于目标时（id === name 很常见）只能插一次，
+      // 否则会写出两个 disabled: true —— YAML 能过，但读起来像手抖。
+      if (inserted) continue
+      // 键的列 = "- " 之后那一列；插在同一列才是兄弟键，不是父级键。
+      const keyIndent = hitLine[1].length + (hitLine[2] === undefined ? 0 : hitLine[2].length)
+      const row = lines.slice(i, j)
+      if (row.some((l) => /^\s*disabled:\s*true\s*$/.test(l))) { already = true; inserted = true; continue }
+      out.push(' '.repeat(keyIndent) + 'disabled: true')
+      inserted = true
+    }
+    i = j
+  }
+  if (!hit) return null
+  return { text: out.join('\n'), already }
+}
+
 async function disableOther(ctx, req, res) {
   const url = new URL(req.url, 'http://local')
   const target = String(url.searchParams.get('target') ?? '').trim()
@@ -225,23 +339,37 @@ async function disableOther(ctx, req, res) {
   if (!existsSync(file)) return sendJson(res, 404, { ok: false, error: 'no cordis.patch.yml in ' + dir })
   let YAML
   try { YAML = await import('yaml') } catch (error) { return sendJson(res, 500, { ok: false, error: 'yaml unavailable: ' + String(error?.message ?? error) }) }
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..*$/, '').replace('T', '-')
   try {
-    const doc = YAML.parse(readFileSync(file, 'utf8')) ?? []
+    const raw = readFileSync(file, 'utf8')
+    const edited = insertDisabledLine(raw, target)
+    if (edited !== null) {
+      if (edited.already) return sendJson(res, 200, { ok: true, disabled: target, file, note: 'already disabled' })
+      let parsed = null
+      try { parsed = YAML.parse(edited.text) } catch (error) { return sendJson(res, 500, { ok: false, error: 'refused, the edit would break the patch: ' + String(error?.message ?? error) }) }
+      if (!listHasDisabled(parsed, target)) return sendJson(res, 500, { ok: false, error: 'refused, the edit did not set disabled on ' + target })
+      writeFileSync(file + '.bak-' + stamp, raw)
+      writeFileSync(file, edited.text)
+      return sendJson(res, 200, { ok: true, disabled: target, file, note: 'one line added, comments kept; HMR reconciles patch edits live' })
+    }
+    // 罕见写法（flow style 等）退回整份重写：能改，但注释会丢，所以先留备份。
+    const doc = YAML.parse(raw) ?? []
     const list = Array.isArray(doc) ? doc : []
     let changed = false
     for (const entry of list) {
       const rows = Array.isArray(entry?.insert) ? entry.insert : []
       for (const row of rows) {
         const hit = row?.id === target || row?.name === target
-        if (target.length > 0 && !hit) continue
+        if (!hit) continue
         row.disabled = true
         changed = true
       }
       if (entry?.id === target || entry?.name === target) { entry.disabled = true; changed = true }
     }
     if (!changed) return sendJson(res, 200, { ok: false, error: 'target not found: ' + target })
+    writeFileSync(file + '.bak-' + stamp, raw)
     writeFileSync(file, YAML.stringify(list))
-    return sendJson(res, 200, { ok: true, disabled: target, file, note: 'HMR reconciles patch edits live' })
+    return sendJson(res, 200, { ok: true, disabled: target, file, note: 'rewritten as a whole, comments are not preserved' })
   } catch (error) {
     return sendJson(res, 500, { ok: false, error: String(error?.message ?? error) })
   }
@@ -1018,12 +1146,16 @@ async function probe(ctx, req, res) {
   return sendJson(res, 200, out)
 }
 
-export function apply(ctx) {
+function applyInner(ctx) {
   // Mutual exclusion, enforced where it can actually be observed: when another
   // memory engine signed in first, ACC keeps its reporting route and drops its
   // tools, so two memory chains never run in one turn.
-  const clash = engineList().length > 1
-  if (clash) {
+  // 「装了没装」看 patch，「跑没跑」看表。两个都装就必然冲突，不取决于谁先 apply。
+  const installed = readProfileEngines()
+  const bothInstalled = installed !== null && installed.memory === true && installed.acc === true
+  const engineConflict = bothInstalled || engineList().length > 1
+  ACC_TOOLS_REGISTERED = !engineConflict
+  if (engineConflict) {
     ctx.logger?.warn?.('dsh-memory-acc: another memory engine is signed in; tools disabled')
   } else {
   ctx.effect(() => ctx.tools.register({
@@ -1114,7 +1246,7 @@ export function apply(ctx) {
     return () => { delete engines()[ENGINE_ID] }
   }, 'dsh-memory-acc.handshake')
 
-  if (!clash) ctx.effect(() => ctx.tools.register({
+  if (!engineConflict) ctx.effect(() => ctx.tools.register({
     name: 'acc_search',
     description: 'Search the archived conversations from a vague memory: a handful of words is enough, the exact phrase is not required. Returns the matching turns with the session they came from, newest and best first. Use acc_archive first if a session was never archived.',
     parameters: {
@@ -1136,7 +1268,7 @@ export function apply(ctx) {
     }
   }), 'dsh-memory-acc.search')
 
-  if (!clash) ctx.effect(() => ctx.tools.register({
+  if (!engineConflict) ctx.effect(() => ctx.tools.register({
     name: 'acc_persona',
     description: 'Read or add to the eight-facet profile of the person you talk with: temper, mouth, affinity, habits, likes, manner, style, ability. Reading is local and free. Adding one observation writes a single line into one facet.',
     parameters: {
@@ -1178,11 +1310,11 @@ export function apply(ctx) {
   // A session that ran under the standard engine carries its contract in history:
   // every turn ends with memory_report. Switching the engine must not break those
   // sessions, so the same names exist here and mean the ACC thing.
-  if (!clash) ctx.effect(() => ctx.systemPrompt.section({
+  if (!engineConflict) ctx.effect(() => ctx.systemPrompt.section({
     name: 'dsh-memory-acc:pipeline',
     order: 700,
     text: () => [
-      '记忆线路（ACC）：',
+      '记忆流程（ACC）：',
       '· 归档是自动的：ACC 自己从会话日志提取，你不需要每轮汇报任何东西。',
       '· 唯一需要你补的是图片：这一轮如果看过图，把图内容写进 acc_archive 的 images 参数（≤400 字，不复述图中文字）。',
       '· 需要旧内容时用 acc_search 或 memory_read：给几个记得的词就够。',
@@ -1203,7 +1335,7 @@ export function apply(ctx) {
   }, 'dsh-memory-acc.legacy')
 
   function registerLegacyTools() {
-  if (!clash) ctx.effect(() => ctx.tools.register({
+  if (!engineConflict) ctx.effect(() => ctx.tools.register({
     name: 'acc_vivid',
     description: 'Record today\'s notable moment: something genuinely interesting that happened, or something awkward. These are the ones that come back on their own later, so only keep the ones worth being interrupted by.',
     parameters: {
@@ -1222,7 +1354,7 @@ export function apply(ctx) {
     }
   }), 'dsh-memory-acc.vivid')
 
-  if (!clash) ctx.effect(() => ctx.tools.register({
+  if (!engineConflict) ctx.effect(() => ctx.tools.register({
     name: 'memory_promote',
     description: 'Record one conclusion that should outlive this session: a decisive finding, a hard-won lesson, a change of direction. Not for routine progress. Keep it to one sentence.',
     parameters: {
@@ -1238,7 +1370,7 @@ export function apply(ctx) {
     }
   }), 'dsh-memory-acc.promote')
 
-  if (!clash) ctx.effect(() => ctx.tools.register({
+  if (!engineConflict) ctx.effect(() => ctx.tools.register({
     name: 'memory_report',
     description: 'Report what this turn actually did so it can be kept. Call it AFTER you have finished answering the user — its return value is only a receipt, never a substitute for your reply. ACC archives the report and the session it came from; the standard engine used the same name, so old sessions keep working after switching.',
     parameters: {
@@ -1267,7 +1399,7 @@ export function apply(ctx) {
     }
   }), 'dsh-memory-acc.report')
 
-  if (!clash) ctx.effect(() => ctx.tools.register({
+  if (!engineConflict) ctx.effect(() => ctx.tools.register({
     name: 'memory_read',
     description: 'Alias kept for sessions written under the standard engine: read the archive by words you remember. Same result as acc_search.',
     parameters: {
@@ -1326,7 +1458,7 @@ export function apply(ctx) {
     return () => clearInterval(timer)
   }, 'dsh-memory-acc.autoarchive')
 
-  if (!clash) ctx.effect(() => ctx.systemPrompt.context({
+  if (!engineConflict) ctx.effect(() => ctx.systemPrompt.context({
     name: 'dsh-memory-acc',
     order: 130,
     text: (context) => accContextText(context)
@@ -1494,9 +1626,21 @@ export function apply(ctx) {
       }
       if (path.endsWith('/engines')) {
         const list = engineList()
-        return sendJson(res, 200, { engines: list, conflict: list.length > 1, accToolsActive: list.length < 2 })
+        return sendJson(res, 200, { engines: list, conflict: list.length > 1, accToolsActive: ACC_TOOLS_REGISTERED, installed: readProfileEngines() })
       }
       return probe(ctx, req, res)
     }
   }), 'dsh-memory-acc.probe')
 }
+
+export function apply(ctx) {
+  // 启动期绝不外抛：apply 抛错 = DSH 判定没激活 = 整个 web boot 停在
+  // "Failed to load plugins"，用户连界面都进不去。
+  try {
+    applyInner(ctx)
+  } catch (error) {
+    try { ctx.logger?.error?.('dsh-memory-acc: apply failed; plugin stays loaded but inert', error) } catch { /* 日志不许再抛 */ }
+    try { console.error('dsh-memory-acc: apply failed', error) } catch { /* 同上 */ }
+  }
+}
+
