@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-acc",
-  "version": "1.0.8",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "description": "ACC memory: keep every complete conversation, borrow the harness's own model, never ask for a key.",

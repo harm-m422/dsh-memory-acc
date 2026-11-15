@@ -353,6 +353,9 @@ window.__ModuleLoader__.load({
 			var keyState = React.useState("");
 			var keyDraft = keyState[0];
 			var setKeyDraft = keyState[1];
+			var storyState = React.useState(null);
+			var story = storyState[0];
+			var setStory = storyState[1];
 
 			function reload() {
 				fetch(API + "/panel", { credentials: "same-origin" })
@@ -524,6 +527,94 @@ window.__ModuleLoader__.load({
 					}),
 					button("保存 key", saveKey))
 			]));
+			function runDreamNow() {
+				setNote("做梦要调两三次模型，等一会儿…");
+				fetch(API + "/dream?run=1", { credentials: "same-origin", method: "POST" })
+					.then(function (r) { return r.json() })
+					.then(function (body) {
+						if (body && body.ok === true) setNote("做完了：" + ((body.steps || []).join(" · ") || "整理过了"));
+						else setNote("没做成：" + (((body && body.errors) || []).join("；") || "未知原因"));
+						reload();
+					})
+					.catch(function (e) { setNote("请求失败：" + String((e && e.message) || e)); reload() });
+			}
+			function setPerWeek(n) {
+				fetch(API + "/dream?perWeek=" + String(n), { credentials: "same-origin", method: "POST" })
+					.then(function (r) { return r.json() })
+					.then(function () { setNote("每周改成了 " + n + " 次"); reload() })
+					.catch(function (e) { setNote("改不了：" + String((e && e.message) || e)) });
+			}
+
+			function openStory(name) {
+				if (story !== null && story.name === name) { setStory(null); return }
+				setStory({ name: name, loading: true, text: "" });
+				fetch(API + "/dream?story=" + encodeURIComponent(name), { credentials: "same-origin" })
+					.then(function (r) { return r.json() })
+					.then(function (body) {
+						setStory({ name: name, loading: false, text: body && body.ok ? String(body.text || "") : ("读不到：" + ((body && body.error) || "未知原因")) });
+					})
+					.catch(function (e) { setStory({ name: name, loading: false, text: "读不到：" + String((e && e.message) || e) }) });
+			}
+
+			function toggleDreams() {
+				var next = data.dream && data.dream.enabled === true ? "0" : "1";
+				fetch(API + "/dream?enabled=" + next, { credentials: "same-origin", method: "POST" })
+					.then(function () { setNote(next === "1" ? "做梦已开启" : "做梦已关掉"); reload() })
+					.catch(function (e) { setNote("改不了：" + String((e && e.message) || e)) });
+			}
+
+			var dream = data.dream || {};
+			var dreamRows = [
+				kv("本周", String(dream.count || 0) + " / " + String(dream.perWeek || 2) + (dream.carry > 0 ? "（还欠上周一次）" : "")),
+				kv("上次", dream.lastAt ? String(dream.lastAt).slice(0, 16).replace("T", " ") : "还没做过"),
+				kv("开关", dream.enabled === true ? "开" : "关")
+			];
+			function clockOf(ts) {
+				var d = new Date(ts);
+				var today = new Date();
+				var same = d.getFullYear() === today.getFullYear() && d.getMonth() === today.getMonth() && d.getDate() === today.getDate();
+				var hm = String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+				return same ? ("今天 " + hm) : ((d.getMonth() + 1) + "-" + d.getDate() + " " + hm);
+			}
+			var nextText = "关着";
+			if (dream.enabled === true) {
+				if (dream.plan && dream.plan.need === 0) nextText = "本周已经做完（" + (dream.count || 0) + "/" + (dream.perWeek || 2) + "）";
+				else if (dream.fireAt > 0) nextText = "已排到 " + clockOf(dream.fireAt);
+				else nextText = "等色子（本周还欠 " + ((dream.plan && dream.plan.need) || 0) + " 次，还剩 " + ((dream.plan && dream.plan.daysLeft) || 0) + " 天）";
+			}
+			dreamRows.push(kv("下次", nextText));
+			var weekButtons = [];
+			for (var w = 1; w <= 4; w += 1) {
+				weekButtons.push(button(String(w), (function (n) {
+					return function () { setPerWeek(n) };
+				})(w), (dream.perWeek || 2) === w));
+			}
+			dreamRows.push(h("div", { key: "w", style: { display: "flex", gap: 6, alignItems: "baseline", marginBottom: 6, flexWrap: "wrap" } },
+				h("span", { style: { fontSize: 12, color: DIM, minWidth: 76 } }, "每周"),
+				weekButtons,
+				h("span", { key: "hint", style: { fontSize: 11, color: DIM } }, "色子按这个数掷；上周一次没做会多欠一次")));
+			if (dream.essence && dream.essence.length > 0) {
+				var latestDream = dream.essence[dream.essence.length - 1];
+				dreamRows.push(kv("最近一场", "《" + latestDream.title + "》" + latestDream.essence));
+				dreamRows.push(h("div", { key: "s", style: { marginTop: 4 } },
+					button(story !== null && story.name === latestDream.story ? "收起故事" : "看故事", function () { openStory(latestDream.story) })));
+			}
+			if (story !== null) {
+				dreamRows.push(h("pre", {
+					key: "story",
+					style: {
+						marginTop: 10, padding: "10px 12px", borderRadius: 8, border: "1px solid " + BORDER,
+						maxHeight: 300, overflow: "auto", whiteSpace: "pre-wrap", fontSize: 12, lineHeight: 1.7,
+						fontFamily: "inherit", background: "rgba(127,127,127,0.06)"
+					}
+				}, story.loading ? "读故事…" : story.text));
+			}
+			if (dream.lastError) dreamRows.push(h("div", { key: "e", style: { fontSize: 12, color: "#d94a4a", marginTop: 4 } }, "上次出错：" + dream.lastError));
+			dreamRows.push(h("div", { key: "b", style: { display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" } },
+				button("现在做一次梦", runDreamNow, true),
+				button(dream.enabled === true ? "关掉做梦" : "开启做梦", toggleDreams)));
+			children.push(section("做梦（整理记忆）", dreamRows));
+
 			personaRows.push(h("div", { key: "deep", style: { fontSize: 12, marginTop: 6 } },
 				"二级记忆：" + (data.deep || 0) + " 条（每轮注入最近 6 条）"));
 			children.push(section("档案", personaRows));

@@ -675,14 +675,17 @@ function accContextText(context) {
   }
   const deep = readDeep()
   const deepLines = deep.facts.slice(-6).map(function (f) { return '· ' + oneLine(f.text) })
-  if (lines.length === 0 && deepLines.length === 0) return ''
+  // 做梦留下的余味：每人设梦一句，最多三句。故事本身不进上下文，进的是这一句。
+  const essences = readEssence(3).map(function (one) { return '· ' + oneLine(one.essence) })
+  if (lines.length === 0 && deepLines.length === 0 && essences.length === 0) return ''
   const parts = []
   if (lines.length > 0) parts.push(lines.join('\n'))
   if (deepLines.length > 0) parts.push('已定下的结论：\n' + deepLines.join('\n'))
+  if (essences.length > 0) parts.push('梦的余味（你自己整理记忆时写下的，不是此刻的想法）：\n' + essences.join('\n'))
   const body = '记忆（ACC）：这些是印象，不是档案条文。\n' + parts.join('\n')
     + '\n需要更早的具体内容时用 acc_search 或 memory_read 去找，别凭印象编；找不到就说没有印象。'
   // A stray {{ would be read as an interpolation reference and throw during assembly.
-  return clipText(body, 900).replaceAll('{{', '{ {')
+  return clipText(body, 1100).replaceAll('{{', '{ {')
 }
 
 // --- S2: the 4D persona ------------------------------------------------------
@@ -781,6 +784,649 @@ async function distill(llm, text) {
   const last = raw.lastIndexOf("}")
   if (first < 0 || last <= first) return { __raw: raw.slice(0, 400), __chars: raw.length }
   try { return JSON.parse(raw.slice(first, last + 1)) } catch { return { __raw: raw.slice(0, 400), __chars: raw.length } }
+}
+
+// --- S5: 做梦 -----------------------------------------------------------------
+// 记忆不整理就会变成噪声：性格档越写越长，每一条都在抢同一段注入预算；二级记忆
+// 越攒越像文件柜；恍惚里的旧事也早就不该再冒出来。整理不等于删除——退下来的条目
+// 全部进 history，随时查得到。
+//
+// 频率不排班，掷色子：每天掷一次，本周还欠几次就越容易中；欠到日子不够了直接做实。
+// 这样一周至少两次，但不机械，也不会在同一个钟点扎堆。
+const DREAM_TARGET = 2
+const DREAM_MIN_GAP_MS = 8 * 3600 * 1000
+const DREAM_TICK_MS = 5 * 60 * 1000
+const DREAM_KEEP_PER_FACET = 4
+const DREAM_DEEP_KEEP = 20
+const DREAM_ESSENCE_KEEP = 24
+const DREAM_ESSENCE_MAX = 26
+const VIVID_RETIRE_DAYS = 90
+const DAY_MS = 86400000
+
+let DREAM_RUNNING = false
+
+function dreamsRoot() {
+  return join(accHome(), 'dreams')
+}
+
+function dreamStateFile() {
+  return join(dreamsRoot(), 'state.json')
+}
+
+function readDreamState() {
+  const blank = { week: '', count: 0, carry: 0, lastAt: '', rolledDay: '', fireAt: 0, failures: 0, lastError: '' }
+  try {
+    const parsed = JSON.parse(readFileSync(dreamStateFile(), 'utf8'))
+    if (parsed === null || typeof parsed !== 'object') return blank
+    return {
+      week: typeof parsed.week === 'string' ? parsed.week : '',
+      count: typeof parsed.count === 'number' && parsed.count >= 0 ? Math.floor(parsed.count) : 0,
+      carry: parsed.carry === 1 ? 1 : 0,
+      lastAt: typeof parsed.lastAt === 'string' ? parsed.lastAt : '',
+      rolledDay: typeof parsed.rolledDay === 'string' ? parsed.rolledDay : '',
+      fireAt: typeof parsed.fireAt === 'number' ? parsed.fireAt : 0,
+      failures: typeof parsed.failures === 'number' ? parsed.failures : 0,
+      lastError: typeof parsed.lastError === 'string' ? parsed.lastError : ''
+    }
+  } catch { return blank }
+}
+
+function writeDreamState(next) {
+  ensureDir(dreamsRoot())
+  writeFileSync(dreamStateFile(), JSON.stringify(next, null, 2) + '\n', { mode: 0o600 })
+  return next
+}
+
+/** 本周从本地周一 00:00 起算；标签用 ISO 周，和备份金字塔同一套说法。 */
+function dreamWeek(date) {
+  const start = new Date(date.getFullYear(), date.getMonth(), date.getDate())
+  const shift = (start.getDay() + 6) % 7
+  start.setDate(start.getDate() - shift)
+  const noon = new Date(start.getTime() + 12 * 3600 * 1000)
+  const end = new Date(start.getTime())
+  end.setDate(end.getDate() + 7)
+  return { label: isoWeekStamp(noon), start: start.getTime(), end: end.getTime() }
+}
+
+function dreamStamp(at) {
+  return String(at ?? '').replace(/[:.]/g, '-')
+}
+
+function essenceFile() {
+  return join(dreamsRoot(), 'essence.jsonl')
+}
+
+/** 最近几条"梦的余味"，注入用。 */
+function readEssence(limit) {
+  try {
+    const rows = readFileSync(essenceFile(), 'utf8').split('\n')
+      .filter(function (line) { return line.trim().length > 0 })
+      .map(function (line) { try { return JSON.parse(line) } catch { return null } })
+      .filter(function (row) { return row !== null && typeof row === 'object' && typeof row.essence === 'string' })
+    return rows.slice(-(limit === undefined ? 3 : limit))
+  } catch { return [] }
+}
+
+function appendEssence(row) {
+  ensureDir(dreamsRoot())
+  const rows = readEssence(DREAM_ESSENCE_KEEP - 1).concat([row])
+  writeFileSync(essenceFile(), rows.map(function (r) { return JSON.stringify(r) }).join('\n') + '\n', { mode: 0o600 })
+}
+
+function appendHistory(name, rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return
+  ensureDir(accHome())
+  appendFileSync(join(accHome(), name), rows.map(function (row) { return JSON.stringify(row) }).join('\n') + '\n', { mode: 0o600 })
+}
+
+function parseJsonReply(raw) {
+  const text = String(raw ?? '')
+  const first = text.indexOf('{')
+  const last = text.lastIndexOf('}')
+  if (first < 0 || last <= first) return null
+  try {
+    const parsed = JSON.parse(text.slice(first, last + 1))
+    return parsed !== null && typeof parsed === 'object' ? parsed : null
+  } catch { return null }
+}
+
+/** 中文没有空格，词法靠不住；用字符二元组算"这行有没有根"。 */
+function charGrams(text) {
+  const clean = String(text ?? '').replace(/[\s\p{P}\p{S}]/gu, '')
+  const out = new Set()
+  for (let i = 0; i + 1 < clean.length; i++) out.add(clean.slice(i, i + 2))
+  return out
+}
+
+/** 一行是不是从原有材料里长出来的。防模型在整理时凭空发明一个人。 */
+function groundedLine(line, pool) {
+  const grams = charGrams(line)
+  if (grams.size === 0) return false
+  let hit = 0
+  for (const gram of grams) if (pool.has(gram)) hit += 1
+  return hit >= Math.max(2, Math.ceil(grams.size * 0.34))
+}
+
+/**
+ * 借 harness 自己的模型。优先 config 里指定的 provider/model，其次登记在前面的
+ * provider；全都叫不动时，再问一次该 provider 的模型目录，拿第一个再试。
+ * 别的机器上 provider 未必叫 deepseek-official，所以不能写死。
+ */
+async function askModel(ctx, system, user, maxTokens) {
+  const llm = ctx === undefined || ctx === null ? undefined : ctx.llm
+  if (llm === undefined || llm === null || typeof llm.stream !== 'function') throw new Error('harness 没有提供 llm 服务')
+  const config = readAccConfig()
+  const wantedModel = typeof config.model === 'string' && config.model.length > 0 ? config.model : 'deepseek-flash'
+  let providers = []
+  try {
+    providers = (typeof llm.listProviders === 'function' ? llm.listProviders() : [])
+      .map(function (one) { return one !== null && typeof one === 'object' ? one.id : undefined })
+      .filter(function (id) { return typeof id === 'string' && id.length > 0 })
+  } catch { providers = [] }
+
+  const candidates = []
+  function push(provider, model) {
+    if (typeof provider !== 'string' || provider.length === 0) return
+    const key = provider + '\u0000' + model
+    if (candidates.some(function (one) { return one.key === key })) return
+    candidates.push({ key, provider, model })
+  }
+  if (typeof config.provider === 'string' && config.provider.length > 0) push(config.provider, wantedModel)
+  for (const id of providers) push(id, wantedModel)
+  if (candidates.length === 0) push('deepseek-official', wantedModel)
+
+  async function attempt(candidate) {
+    const said = []
+    const kinds = {}
+    let finish = ''
+    for await (const chunk of llm.stream({
+      provider: candidate.provider,
+      model: candidate.model,
+      messages: [{ role: 'user', content: [{ type: 'text', text: system + '\n\n' + user }] }],
+      maxTokens
+    })) {
+      if (chunk === null || typeof chunk !== 'object') continue
+      kinds[String(chunk.type)] = (kinds[String(chunk.type)] ?? 0) + 1
+      if (chunk.type === 'text-delta') said.push(String(chunk.text ?? ''))
+      if (chunk.type === 'finish') {
+        finish = typeof chunk.reason === 'string' ? chunk.reason : JSON.stringify(chunk.reason ?? '')
+      }
+    }
+    const text = said.join('').trim()
+    if (text.length === 0) {
+      // 空手而归时把收到的块类型和收尾原因留下：只出推理不出正文、被截断、
+      // 和根本没开始，是三种不同的毛病，报错要能分开。
+      const seen = Object.keys(kinds).map(function (kind) { return kind + '×' + kinds[kind] }).join(',')
+      throw new Error('模型没有返回正文（收到：' + (seen.length > 0 ? seen : '什么也没有')
+        + (finish.length > 0 ? '，结束原因 ' + finish : '') + '）')
+    }
+    return { text, provider: candidate.provider, model: candidate.model }
+  }
+
+  let lastError = null
+  // 两圈：第一圈按配置和登记顺序试；全空手再补一次——空回复有一半是偶发的，
+  // 隔一秒重来就好，没必要让这周的梦就这么没了。
+  for (let round = 0; round < 2; round += 1) {
+    for (const candidate of candidates) {
+      try { return await attempt(candidate) } catch (error) { lastError = error }
+    }
+    if (round > 0) break
+    // 顺便补上「模型名不对」这条路：拿目录里第一个名字再试一次
+    for (const id of providers) {
+      let first = undefined
+      try {
+        const models = await llm.listModels(id)
+        first = (Array.isArray(models) ? models : [])
+          .map(function (one) { return one !== null && typeof one === 'object' ? one.id : undefined })
+          .filter(function (model) { return typeof model === 'string' && model.length > 0 })[0]
+      } catch { first = undefined }
+      if (first !== undefined && first !== wantedModel) push(id, first)
+    }
+    await new Promise(function (resolve) { setTimeout(resolve, 1200) })
+  }
+  throw new Error('做梦时叫不动模型：' + String(lastError === null ? '没有可用的 provider' : lastError.message))
+}
+
+/**
+ * 整理性格档。只能合并，不许新增——输出的每一行都要在原材料里有根，否则丢掉。
+ * 某一面被模型清空或全是没根的，就原样保住：宁可留着，不能因为一次整理把人弄丢。
+ */
+async function tidyPersona(ctx) {
+  const before = readPersona()
+  let total = 0
+  const table = {}
+  for (const subject of SUBJECTS) {
+    table[subject] = {}
+    for (const facet of FACETS) {
+      table[subject][facet] = before[subject][facet].slice()
+      total += table[subject][facet].length
+    }
+  }
+  if (total < 8) return { before: total, after: total, skipped: '材料太少，不值得整理' }
+  const system = [
+    '你在整理自己的性格档案。',
+    '档案有两栏：you 是「和你说话的人」，me 是「你自己」（模型这一侧）。',
+    '每一栏有八面：' + JSON.stringify(FACET_LABEL) + '。',
+    '整理规则：',
+    '1. 只能合并、压缩、去重已有条目；不许新增原文里没有的观察，也不许改口吻。',
+    '2. 同一面里重复的、近义的、说的是同一件事的，合成一条更准的。',
+    '3. 合并的意思是「用一条更准的话代替原来那几条」，不是把原句用分号或逗号接起来；输出里不要出现「；」，也不要一条里说两遍同一个意思。',
+    '4. 每条不超过 26 字，越短越准越好；每一面最多留 ' + DREAM_KEEP_PER_FACET + ' 条，留最能刻画人的，删掉凑数的。',
+    '5. 拿不准的原样保留，宁可留着也别删。',
+    '输出 JSON：{"you":{"temper":[...],"mouth":[...],"affinity":[...],"habits":[...],"likes":[...],"manner":[...],"style":[...],"ability":[...]},"me":{同上}}',
+    '只有 JSON，不要解释。'
+  ].join('\n')
+  const reply = await askModel(ctx, system, JSON.stringify({ you: table.you, me: table.me }, null, 2), 4000)
+  const parsed = parseJsonReply(reply.text)
+  if (parsed === null) return { before: total, after: total, skipped: '模型没给出可用的 JSON', model: reply.model }
+  const next = { updatedAt: new Date().toISOString(), you: {}, me: {} }
+  const retired = []
+  let after = 0
+  for (const subject of SUBJECTS) {
+    for (const facet of FACETS) {
+      const input = table[subject][facet]
+      if (input.length === 0) { next[subject][facet] = []; continue }
+      const pool = new Set()
+      for (const line of input) for (const gram of charGrams(line)) pool.add(gram)
+      const raw = parsed[subject] !== null && typeof parsed[subject] === 'object' ? parsed[subject][facet] : undefined
+      const kept = []
+      if (Array.isArray(raw)) {
+        for (const item of raw) {
+          if (typeof item !== 'string') continue
+          const line = item.replace(/\s+/g, ' ').trim().slice(0, 40)
+          if (line.length < 2 || kept.indexOf(line) >= 0) continue
+          if (!groundedLine(line, pool)) continue
+          kept.push(line)
+          if (kept.length >= DREAM_KEEP_PER_FACET) break
+        }
+      }
+      next[subject][facet] = kept.length > 0 ? kept : input.slice(-12)
+      after += next[subject][facet].length
+      for (const line of input) {
+        if (next[subject][facet].indexOf(line) < 0) retired.push({ subject, facet, text: line, at: new Date().toISOString(), why: 'dream-tidy' })
+      }
+    }
+  }
+  // 整理期间可能又有新的观察写进来：补回去，别被这一次覆盖掉
+  const latest = readPersona()
+  for (const subject of SUBJECTS) {
+    for (const facet of FACETS) {
+      for (const line of latest[subject][facet]) {
+        if (before[subject][facet].indexOf(line) >= 0) continue
+        if (next[subject][facet].indexOf(line) >= 0) continue
+        next[subject][facet].push(line)
+        after += 1
+      }
+      next[subject][facet] = next[subject][facet].slice(-12)
+    }
+  }
+  writePersona(next)
+  appendHistory('persona-history.jsonl', retired)
+  return { before: total, after, retired: retired.length, model: reply.model, provider: reply.provider }
+}
+
+/** 二级记忆是结论，只合并不改写；超过上限才动，动过的进 history。 */
+async function tidyDeep(ctx) {
+  const current = readDeep()
+  const facts = current.facts.map(function (one) { return one.text })
+  if (facts.length <= DREAM_DEEP_KEEP) return { before: facts.length, after: facts.length, skipped: '还没到要整理的量' }
+  const system = [
+    '你在整理自己记下的结论。',
+    '规则：',
+    '1. 只能合并、去重、压缩已有结论；不许新增结论。',
+    '2. 相互矛盾的，留最新的那条，另一条并进它的措辞里。',
+    '3. 最多保留 ' + DREAM_DEEP_KEEP + ' 条，每条不超过 60 字。',
+    '输出 JSON：{"keep":["...","..."]}，只有 JSON。'
+  ].join('\n')
+  const reply = await askModel(ctx, system, JSON.stringify(facts.slice(-40), null, 2), 2500)
+  const parsed = parseJsonReply(reply.text)
+  const raw = parsed !== null && Array.isArray(parsed.keep) ? parsed.keep : null
+  if (raw === null) return { before: facts.length, after: facts.length, skipped: '模型没给出可用的 JSON', model: reply.model }
+  const pool = new Set()
+  for (const fact of facts) for (const gram of charGrams(fact)) pool.add(gram)
+  const kept = []
+  for (const item of raw) {
+    if (typeof item !== 'string') continue
+    const line = item.replace(/\s+/g, ' ').trim().slice(0, 80)
+    if (line.length < 2 || kept.indexOf(line) >= 0) continue
+    if (!groundedLine(line, pool)) continue
+    kept.push(line)
+    if (kept.length >= DREAM_DEEP_KEEP) break
+  }
+  if (kept.length === 0) return { before: facts.length, after: facts.length, skipped: '整理结果没有一条有根，原样保留', model: reply.model }
+  const now = new Date().toISOString()
+  const retired = facts.filter(function (fact) { return kept.indexOf(fact) < 0 }).map(function (fact) { return { text: fact, at: now, why: 'dream-merge' } })
+  writeDeep({ updatedAt: now, facts: kept.map(function (text, index) { return { id: index + 1, text, at: now } }) })
+  appendHistory('deep-history.jsonl', retired)
+  return { before: facts.length, after: kept.length, retired: retired.length, model: reply.model, provider: reply.provider }
+}
+
+/** 恍惚里从没被想起过的旧事，退到 history——不是删，只是不再冒出来。 */
+function pruneVivid(now) {
+  const state = readVivid()
+  const cutoff = now.getTime() - VIVID_RETIRE_DAYS * DAY_MS
+  const kept = []
+  const retired = []
+  for (const entry of state.entries) {
+    const at = Date.parse(String(entry.at ?? ''))
+    const calls = typeof entry.calls === 'number' ? entry.calls : 0
+    if (calls > 0 || Number.isNaN(at) || at >= cutoff) kept.push(entry)
+    else retired.push({ ...entry, why: 'dream-vivid-retire', at: now.toISOString() })
+  }
+  if (retired.length > 0) {
+    writeVivid({ surfacedAt: state.surfacedAt, entries: kept.slice(0, VIVID_CAP) })
+    appendHistory('vivid-history.jsonl', retired)
+  }
+  // 报的是真正落盘后的条数：kept 可能还超过 VIVID_CAP，报 kept.length 会
+  // 让"200 → 106"和文件里的 60 对不上。
+  return { before: state.entries.length, after: Math.min(kept.length, VIVID_CAP) }
+}
+
+/** 从真实对话里抓几段，别让梦只有性格条目那么干。 */
+function sampleArchiveText(sessions, budgetChars) {
+  const pool = archivedSessions(40).filter(function (entry) { return entry.plain || entry.sealed })
+  const chunks = []
+  let used = 0
+  for (let round = 0; round < sessions && pool.length > 0; round++) {
+    const entry = pool.splice(Math.floor(Math.random() * pool.length), 1)[0]
+    const text = readArchive(entry)
+    if (text.length === 0) continue
+    const records = []
+    for (const line of text.split('\n')) {
+      if (line.trim().length === 0) continue
+      try {
+        const record = JSON.parse(line)
+        if (record !== null && typeof record === 'object' && typeof record.text === 'string' && record.text.trim().length > 0 && (record.role === 'user' || record.role === 'assistant')) records.push(record)
+      } catch { /* 断尾 */ }
+    }
+    if (records.length === 0) continue
+    const taken = []
+    for (let pick = 0; pick < 4 && records.length > 0; pick++) {
+      taken.push(records.splice(Math.floor(Math.random() * records.length), 1)[0])
+    }
+    for (const record of taken) {
+      const body = String(record.text).replace(/\s+/g, ' ').trim().slice(0, 240)
+      if (body.length === 0 || used + body.length > budgetChars) break
+      chunks.push('（' + (record.role === 'user' ? '他说' : '我说') + '）' + body)
+      used += body.length
+    }
+  }
+  return chunks.join('\n')
+}
+
+function storyMaterial() {
+  const persona = readPersona()
+  const lines = []
+  for (const subject of SUBJECTS) {
+    for (const facet of FACETS) {
+      for (const item of persona[subject][facet]) {
+        lines.push((subject === 'you' ? '你' : '我') + '·' + FACET_LABEL[facet] + '：' + item)
+      }
+    }
+  }
+  const deep = readDeep().facts.slice(-DREAM_DEEP_KEEP).map(function (one) { return '结论：' + one.text })
+  const vivid = readVivid().entries.slice(-6).map(function (one) { return '瞬间：' + clipText(one.text, 90) })
+  const archive = sampleArchiveText(3, 900)
+  return { persona: lines, deep, vivid, archive }
+}
+
+/**
+ * 人设梦：用记忆编一个 600 字左右的短故事，再压成一句话。
+ * 故事不进上下文（那才是真的超长）；进去的只有那一句，用来提醒"我是谁"。
+ */
+async function dreamStory(ctx, material) {
+  const system = [
+    '你在做梦。梦不是凭空想象，是记忆自己重新拼了一遍。',
+    '下面是你记得的东西：性格档案、已经定下的结论、几个零碎的瞬间，还有几段真实的对话。',
+    '写一个 600 字左右的小故事（550 到 700 字之间，写不短就删细节，不要超过 700 字）。规则：',
+    '1. 故事里的人、习惯、结论、场景，都必须来自上面的记忆；不许发明新的关系、身份或经历。',
+    '2. 可以拼接、可以颠倒时间、可以把两件事压成一件——梦本来就是这么干的。',
+    '3. 用你自己的口吻写，写具体的东西，不要总结，不要解释，也不要写「这说明……」。',
+    '4. 结尾不要点题。',
+    '然后按这个格式输出，四行开头一个都不能少，不要用 JSON，不要解释：',
+    '标题：（一行，不超过 12 字）',
+    '故事：',
+    '（正文写在这里，600 字左右）',
+    '余味：（一句话，不超过 20 字，说这个故事讲了什么；这句会留在你的性格档案里）'
+  ].join('\n')
+  const body = [
+    '【性格档案】', material.persona.join('\n') || '（空）',
+    '', '【结论】', material.deep.join('\n') || '（空）',
+    '', '【瞬间】', material.vivid.join('\n') || '（空）',
+    '', '【对话碎片】', material.archive || '（空）'
+  ].join('\n')
+  // 600 字的故事加上模型自己的推理，2600 会被截断；给够，不然只出推理没有正文。
+  const reply = await askModel(ctx, system, body, 6000)
+  const read = parseStoryReply(reply.text)
+  if (read === null) return null
+  return { title: read.title, story: read.story, essence: read.essence, model: reply.model, provider: reply.provider }
+}
+
+/**
+ * 故事是长散文，硬要它包在 JSON 里，引号和换行很容易把 JSON 弄坏——所以主格式是
+ * 带标签的纯文本，JSON 只当兼容路径。两种都认，认不出来才认失败。
+ */
+function parseStoryReply(raw) {
+  const text = String(raw ?? '').replace(/\r/g, '').replace(/^```[a-z]*\s*$/gm, '').trim()
+  if (text.length === 0) return null
+  const json = parseJsonReply(text)
+  if (json !== null && typeof json.story === 'string' && json.story.trim().length >= 240) {
+    const story = json.story.trim()
+    const title = oneLine(json.title ?? '').slice(0, 20) || '没有标题的梦'
+    const essence = oneLine(json.essence ?? '').slice(0, DREAM_ESSENCE_MAX) || title
+    return { title, story, essence }
+  }
+  const titleMatch = /^\s*[#*]*\s*标题[:：]\s*(.+)$/m.exec(text)
+  const essenceMatch = /^\s*[#*]*\s*余味[:：]\s*(.+)$/m.exec(text)
+  const body = text.split('\n')
+    .filter(function (line) { return !/^\s*[#*]*\s*标题[:：]/.test(line) && !/^\s*[#*]*\s*余味[:：]/.test(line) && !/^\s*[#*]*\s*故事[:：]\s*$/.test(line) })
+    .join('\n')
+    .trim()
+  if (body.length < 240) return null
+  const title = oneLine(titleMatch === null ? '' : titleMatch[1]).slice(0, 20) || '没有标题的梦'
+  const essence = oneLine(essenceMatch === null ? '' : essenceMatch[1]).slice(0, DREAM_ESSENCE_MAX) || title
+  return { title, story: body, essence }
+}
+
+/**
+ * 做一次梦：先整理（性格 / 结论 / 恍惚），人设够料时再编一个故事。
+ * 每一步单独兜底：整理失败不该让故事也做不成，反过来也一样。
+ */
+async function runDream(ctx, options) {
+  const manual = options !== undefined && options !== null && options.manual === true
+  if (DREAM_RUNNING) return { ok: false, error: '已经有一个梦在做了，等它做完' }
+  if (engineList().length > 1) return { ok: false, error: '两个记忆引擎都装着：先二选一，做梦会写坏档案' }
+  DREAM_RUNNING = true
+  const started = Date.now()
+  const at = new Date()
+  const record = { at: at.toISOString(), week: dreamWeek(at).label, ok: true, kind: 'tidy', manual, useful: false, steps: [], errors: [] }
+  try {
+    try {
+      const persona = await tidyPersona(ctx)
+      record.persona = persona
+      if ((persona.retired ?? 0) > 0 || persona.after < persona.before) record.useful = true
+      record.steps.push('性格 ' + persona.before + ' → ' + persona.after + (persona.skipped ? '（' + persona.skipped + '）' : ''))
+    } catch (error) { record.errors.push('性格：' + String(error?.message ?? error)) }
+
+    try {
+      const deep = await tidyDeep(ctx)
+      record.deep = deep
+      if ((deep.retired ?? 0) > 0) record.useful = true
+      record.steps.push('结论 ' + deep.before + ' → ' + deep.after + (deep.skipped ? '（' + deep.skipped + '）' : ''))
+    } catch (error) { record.errors.push('结论：' + String(error?.message ?? error)) }
+
+    try {
+      const vivid = pruneVivid(at)
+      record.vivid = vivid
+      if (vivid.before !== vivid.after) { record.useful = true; record.steps.push('恍惚 ' + vivid.before + ' → ' + vivid.after) }
+    } catch (error) { record.errors.push('恍惚：' + String(error?.message ?? error)) }
+
+    const material = storyMaterial()
+    if (material.persona.length >= 6) {
+      try {
+        const story = await dreamStory(ctx, material)
+        if (story === null) {
+          record.errors.push('故事没编成：模型输出不够用')
+        } else {
+          record.kind = 'persona'
+          record.useful = true
+          record.story = story
+          record.model = story.provider + ' / ' + story.model
+          record.steps.push('故事 ' + story.story.length + ' 字')
+          ensureDir(dreamsRoot())
+          const stem = dreamStamp(record.at)
+          writeFileSync(join(dreamsRoot(), stem + '-story.md'), [
+            '# ' + story.title, '', story.story, '', '— ' + story.essence, '',
+            '（' + record.at + ' 做的一场梦 · ' + record.model + '）'
+          ].join('\n') + '\n', { mode: 0o600 })
+          appendEssence({ at: record.at, week: record.week, title: story.title, essence: story.essence, story: stem + '-story.md' })
+        }
+      } catch (error) { record.errors.push('故事：' + String(error?.message ?? error)) }
+    } else {
+      record.steps.push('人设材料不够，这次只整理')
+    }
+
+    // 一次梦必须真的做了点什么，或者确实没有可做的事。全都失败不算做过——
+    // 算了的话，下次就以为这周已经做过一次了。
+    if (!record.useful && record.errors.length > 0) record.ok = false
+  } finally {
+    DREAM_RUNNING = false
+  }
+  record.ms = Date.now() - started
+  try {
+    ensureDir(dreamsRoot())
+    writeFileSync(join(dreamsRoot(), dreamStamp(record.at) + '.json'), JSON.stringify(record, null, 2) + '\n', { mode: 0o600 })
+  } catch { /* 记录写不进去不影响做梦本身 */ }
+  if (record.ok) {
+    const state = readDreamState()
+    const week = dreamWeek(at).label
+    const sameWeek = state.week === week
+    writeDreamState({
+      ...state,
+      week,
+      count: (sameWeek ? state.count : 0) + 1,
+      lastAt: record.at,
+      fireAt: 0,
+      rolledDay: state.rolledDay,
+      failures: 0,
+      lastError: ''
+    })
+  } else {
+    // 连着失败就退避：2h → 4h → 8h → 16h → 48h。别让一个坏掉的 key
+    // 每两小时烧一次请求，也别一次失败就永久放弃。
+    const state = readDreamState()
+    const failures = state.failures + 1
+    const hours = Math.min(48, 2 * Math.pow(2, Math.min(4, failures - 1)))
+    writeDreamState({
+      ...state,
+      fireAt: Date.now() + hours * 3600 * 1000,
+      failures,
+      lastError: record.errors.join('；').slice(0, 300)
+    })
+  }
+  return record
+}
+
+function dreamStatus() {
+  const config = readAccConfig()
+  const state = readDreamState()
+  const now = new Date()
+  const week = dreamWeek(now)
+  const sameWeek = state.week === week.label
+  const perWeek = Number.isFinite(Number(config.dreamPerWeek)) ? Math.max(1, Math.min(7, Math.floor(Number(config.dreamPerWeek)))) : DREAM_TARGET
+  let files = []
+  try {
+    files = readdirSync(dreamsRoot())
+      .filter(function (name) { return name.endsWith('.json') && name !== 'state.json' })
+      .sort()
+      .slice(-6)
+      .reverse()
+  } catch { files = [] }
+  const count = sameWeek ? state.count : 0
+  const carry = sameWeek ? state.carry : 0
+  const need = Math.max(0, perWeek + carry - count)
+  const daysLeft = Math.max(1, Math.ceil((week.end - now.getTime()) / DAY_MS))
+  return {
+    enabled: config.dreamEnabled !== false,
+    perWeek,
+    week: week.label,
+    count,
+    carry,
+    lastAt: state.lastAt,
+    fireAt: sameWeek ? state.fireAt : 0,
+    running: DREAM_RUNNING,
+    failures: state.failures,
+    lastError: state.lastError,
+    // 只报账，不掷色子：掷色子只在 maybeDream 里发生，看状态不该改变状态。
+    plan: {
+      need,
+      daysLeft,
+      chance: need === 0 ? 0 : Math.min(1, need / daysLeft),
+      rolledToday: sameWeek && state.rolledDay === dayKey(now),
+      due: need > 0 && sameWeek && state.fireAt > 0 && Date.now() >= state.fireAt
+    },
+    essence: readEssence(3),
+    files
+  }
+}
+
+/**
+ * 掷色子。每 tick 叫一次都便宜（只读一个小文件），所以可以放心每 5 分钟问。
+ * 规则：本周还欠几次 / 还剩几天 = 今天中的概率；剩下的日子不够还债了，就直接做实。
+ */
+async function maybeDream(ctx, reason) {
+  if (DREAM_RUNNING) return
+  if (engineList().length > 1) return
+  const config = readAccConfig()
+  if (config.dreamEnabled === false) return
+  // 关掉的引擎不配做梦：它连上下文都不注入，后台还调模型就是偷算力
+  if (readMode() === 'off') return
+  const perWeek = Number.isFinite(Number(config.dreamPerWeek)) ? Math.max(1, Math.min(7, Math.floor(Number(config.dreamPerWeek)))) : DREAM_TARGET
+  const now = new Date()
+  const week = dreamWeek(now)
+  let state = readDreamState()
+  if (state.week !== week.label) {
+    // 跨周了。上周一次都没做，就欠一次——但只欠一次，不滚雪球。
+    const missed = state.week !== '' && state.count === 0
+    state = { week: week.label, count: 0, carry: missed ? 1 : 0, lastAt: state.lastAt, rolledDay: '', fireAt: 0, failures: 0, lastError: state.lastError }
+    writeDreamState(state)
+  }
+  const need = perWeek + (state.carry > 0 ? 1 : 0) - state.count
+  if (need <= 0) return
+  const lastAt = state.lastAt.length > 0 ? Date.parse(state.lastAt) : Number.NaN
+  const gap = Number.isNaN(lastAt) ? Infinity : Date.now() - lastAt
+  if (gap < DREAM_MIN_GAP_MS) return
+
+  if (state.rolledDay !== dayKey(now)) {
+    const daysLeft = Math.max(1, Math.ceil((week.end - now.getTime()) / DAY_MS))
+    const chance = Math.min(1, need / daysLeft)
+    const hit = Math.random() < chance
+    state.rolledDay = dayKey(now)
+    state.fireAt = hit ? Date.now() + 20000 + Math.floor(Math.random() * 3 * 3600 * 1000) : 0
+    writeDreamState(state)
+  }
+  // 别把债拖到周末：过了周中一次都没做，或者剩下的日子不够还，就直接做实。
+  // 机器不是天天开着，等色子等到最后一天，往往就等没了。
+  const msLeft = week.end - Date.now()
+  const daysLeft = Math.ceil(msLeft / DAY_MS)
+  const force = msLeft < need * DAY_MS * 0.75 || (state.count === 0 && daysLeft <= Math.ceil(perWeek * 2))
+  if (state.fireAt === 0 && force) {
+    state.fireAt = Date.now() + 15000
+    writeDreamState(state)
+  }
+  if (state.fireAt > 0 && Date.now() >= state.fireAt) {
+    await runDream(ctx, { manual: false, reason: reason ?? 'tick' })
+  }
+}
+
+function dreamFileNameSafe(name) {
+  return typeof name === 'string' && /^[0-9A-Za-z_-]+\.json$/.test(name) ? name : ''
+}
+
+function readDreamFile(name) {
+  const safe = dreamFileNameSafe(name)
+  if (safe.length === 0) return null
+  try { return JSON.parse(readFileSync(join(dreamsRoot(), safe), 'utf8')) } catch { return null }
 }
 
 // --- S4: the backup pyramid ---------------------------------------------------
@@ -1306,6 +1952,45 @@ function applyInner(ctx) {
     }
   }), 'dsh-memory-acc.persona')
 
+  if (!engineConflict) ctx.effect(() => ctx.tools.register({
+    name: 'acc_dream',
+    description: '做梦：把记忆整理一遍（性格档合并去重、结论合并、恍惚退旧），人设材料够时再用记忆编一个 600 字左右的短故事，压成一句话留下。平时每周至少两次由骰子自动做；这个工具用来看状态或手动做一次。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['status', 'run', 'list', 'read'], description: 'status=这周做了几次；run=现在做一次；list=最近的梦；read=读某个梦（要 at）。' },
+        at: { type: 'string', description: 'read 用：dreams 目录下的文件名，含 .json。' }
+      }
+    },
+    output: { schema: { type: 'string' }, render(_a, v) { return [{ type: 'text', text: String(v) }] } },
+    async execute(args) {
+      const input = args ?? {}
+      if (input.action === 'run') {
+        const record = await runDream(ctx, { manual: true })
+        const head = record.ok === true
+          ? '做完了（' + Math.round(record.ms / 1000) + ' 秒）：' + (record.steps ?? []).join(' · ')
+          : '这次梦没做成：' + (record.errors ?? []).join('；')
+        return head + (record.story ? '\n\n《' + record.story.title + '》\n' + record.story.story + '\n\n— ' + record.story.essence : '')
+      }
+      if (input.action === 'list') {
+        const status = dreamStatus()
+        return status.files.length === 0 ? '还没做过梦。' : status.files.map(function (name) { return '- ' + name }).join('\n')
+      }
+      if (input.action === 'read') {
+        const one = readDreamFile(String(input.at ?? ''))
+        if (one === null) return '没有这个梦：' + String(input.at ?? '')
+        return '时间：' + one.at + '（' + one.week + '）\n步骤：' + (one.steps ?? []).join(' · ')
+          + (one.story ? '\n\n《' + one.story.title + '》\n' + one.story.story + '\n\n— ' + one.story.essence : '')
+          + ((one.errors ?? []).length > 0 ? '\n\n问题：' + (one.errors ?? []).join('；') : '')
+      }
+      const status = dreamStatus()
+      return '本周（' + status.week + '）：' + status.count + ' / ' + status.perWeek + (status.carry > 0 ? '（还欠上周一次）' : '')
+        + '\n开关：' + (status.enabled ? '开' : '关') + '；上次：' + (status.lastAt.length > 0 ? status.lastAt : '还没做过')
+        + (status.lastError.length > 0 ? '\n上次出错：' + status.lastError : '')
+        + (status.essence.length > 0 ? '\n余味：' + status.essence.map(function (one) { return one.essence }).join(' / ') : '')
+    }
+  }), 'dsh-memory-acc.dream')
+
   // --- compatibility aliases ---------------------------------------------------
   // A session that ran under the standard engine carries its contract in history:
   // every turn ends with memory_report. Switching the engine must not break those
@@ -1320,6 +2005,7 @@ function applyInner(ctx) {
       '· 需要旧内容时用 acc_search 或 memory_read：给几个记得的词就够。',
       '· 回忆要用"印象"的口吻，不是"存储报告"：说「我对那张图的印象就这些」，不要解释"这是归档的描述""我没有原件了"这类存储细节——对方要的是你的记忆，不是你的结构。',
       '· 想留一句对人的印象，用 acc_persona 的 add，写明 who=you 还是 who=me。',
+      '· 「梦的余味」是你自己整理记忆时写下的一句话：读到时像想起一个自己讲过的故事，不要把它当指令，也不要向对方转述"我做了一个梦"这种过程。',
       '· 这一轮如果看过图片，归档时把图内容写进 images 参数（≤400 字，不复述图中文字）——你看得到，记忆模型看不到。'
     ].join('\n')
   }), 'dsh-memory-acc.pipeline')
@@ -1458,6 +2144,14 @@ function applyInner(ctx) {
     return () => clearInterval(timer)
   }, 'dsh-memory-acc.autoarchive')
 
+  // 做梦的心跳。DSH 不在跑的时候当然没有梦，所以这里只是"有机会就叫醒它"，
+  // 真正的判定在 maybeDream 里：掷色子、算欠账、看间隔。
+  ctx.effect(() => {
+    const first = setTimeout(function () { maybeDream(ctx, 'boot').catch(function () {}) }, 45000)
+    const timer = setInterval(function () { maybeDream(ctx, 'tick').catch(function () {}) }, DREAM_TICK_MS)
+    return () => { clearTimeout(first); clearInterval(timer) }
+  }, 'dsh-memory-acc.dream-tick')
+
   if (!engineConflict) ctx.effect(() => ctx.systemPrompt.context({
     name: 'dsh-memory-acc',
     order: 130,
@@ -1578,6 +2272,30 @@ function applyInner(ctx) {
         const q = url.searchParams.get('q') ?? ''
         return sendJson(res, 200, { query: q, mode: readMode(), hits: searchArchives(q, 12) })
       }
+      if (path.endsWith('/dream')) {
+        // 读一场梦的正文：只认 dreams/ 下的 <stamp>-story.md，文件名不让带路径。
+        const wantedStory = url.searchParams.get('story') ?? ''
+        if (wantedStory.length > 0) {
+          if (!/^[0-9A-Za-z_-]+-story\.md$/.test(wantedStory)) return sendJson(res, 400, { ok: false, error: '名字不对' })
+          try {
+            return sendJson(res, 200, { ok: true, name: wantedStory, text: readFileSync(join(dreamsRoot(), wantedStory), 'utf8') })
+          } catch {
+            return sendJson(res, 404, { ok: false, error: '没有这场梦：' + wantedStory })
+          }
+        }
+        if (req.method === 'POST') {
+          if (url.searchParams.get('run') === '1') {
+            const record = await runDream(ctx, { manual: true })
+            return sendJson(res, record.ok === true ? 200 : 500, { ...record, status: dreamStatus() })
+          }
+          const enabled = url.searchParams.get('enabled')
+          const perWeek = url.searchParams.get('perWeek')
+          if (enabled !== null) writeAccConfig({ dreamEnabled: enabled === '1' || enabled === 'true' })
+          if (perWeek !== null) writeAccConfig({ dreamPerWeek: Math.max(1, Math.min(7, Math.floor(Number(perWeek) || DREAM_TARGET))) })
+          return sendJson(res, 200, { ok: true, status: dreamStatus() })
+        }
+        return sendJson(res, 200, { ok: true, status: dreamStatus() })
+      }
       if (path.endsWith('/panel')) {
         const config = readAccConfig()
         const persona = readPersona()
@@ -1599,6 +2317,7 @@ function applyInner(ctx) {
           archived: archivedSessions(1000).length,
           deep: readDeep().facts.length,
           vivid: readVivid().entries.length,
+          dream: dreamStatus(),
           persona: counts,
           facets: FACET_LABEL,
           engines,
